@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Universal Stealth Hooking Library
 // @namespace    http://tampermonkey.net/
-// @version      1.1
-// @description  Standalone universal hooking system for Tampermonkey scripts - Fixed TextDecoder
+// @version      1.2
+// @description  Standalone universal hooking system
 // @author       L3Hong
 // @match        *://*/*
 // @run-at       document-start
@@ -131,9 +131,9 @@
                 const methodName = targetPath[targetPath.length - 1];
                 const original = current[methodName];
 
-                // Handle constructor hooks differently
-                if (this.isConstructor(target, original)) {
-                    return this.applyConstructorHook(target, current, methodName, original, hookConfig);
+                // Special handling for TextDecoder
+                if (target === 'TextDecoder') {
+                    return this.applyTextDecoderHook(current, methodName, original, hookConfig);
                 }
 
                 if (typeof original !== 'function') {
@@ -165,121 +165,72 @@
             }
         },
 
-        // Check if target is a constructor
-        isConstructor(target, original) {
-            if (typeof original !== 'function') return false;
-            
-            // Common constructors that need special handling
-            const constructors = ['TextDecoder', 'TextEncoder', 'XMLHttpRequest', 'Blob', 'File', 'FileReader'];
-            const targetName = target.split('.').pop();
-            
-            return constructors.includes(targetName) || 
-                   original.prototype && 
-                   original.prototype.constructor === original;
-        },
-
-        // Apply hook to constructor functions
-        applyConstructorHook(target, current, methodName, original, hookConfig) {
+        // Special hook for TextDecoder that properly handles constructor AND decode method
+        applyTextDecoderHook(current, methodName, original, hookConfig) {
             const self = this;
             
-            // Store original constructor
+            // Store original
             hookConfig.original = original;
 
-            // Create hooked constructor
-            const hookedConstructor = function(...args) {
-                // Ensure called with new
+            // Create a proper constructor wrapper
+            const HookedTextDecoder = function(...args) {
                 if (!new.target) {
-                    throw new TypeError(`Failed to construct '${methodName}': Please use the 'new' operator`);
+                    throw new TypeError("Failed to construct 'TextDecoder': Please use the 'new' operator");
                 }
-
+                
                 // Create instance with original constructor
                 const instance = new original(...args);
-
-                // Apply method hooks to the instance
-                if (hookConfig.methodHooks) {
-                    self.applyInstanceHooks(instance, hookConfig.methodHooks);
-                }
-
-                // Apply specific method hook if provided
-                if (hookConfig.method && hookConfig.afterCall) {
-                    const originalMethod = instance[hookConfig.method];
-                    if (typeof originalMethod === 'function') {
-                        instance[hookConfig.method] = function(...methodArgs) {
-                            const result = originalMethod.apply(this, methodArgs);
-                            return hookConfig.afterCall.call(this, result, methodArgs, originalMethod);
-                        };
+                
+                // Hook the decode method on this specific instance
+                const originalDecode = instance.decode;
+                instance.decode = function(...decodeArgs) {
+                    const result = originalDecode.apply(this, decodeArgs);
+                    
+                    // Apply the afterCall hook if provided
+                    if (hookConfig.afterCall) {
+                        try {
+                            return hookConfig.afterCall.call(this, result, decodeArgs, originalDecode);
+                        } catch (e) {
+                            self.log('Error in TextDecoder.afterCall:', e);
+                            return result;
+                        }
                     }
-                }
-
+                    
+                    return result;
+                };
+                
                 return instance;
             };
 
             // Copy prototype and static properties
-            hookedConstructor.prototype = original.prototype;
-            Object.defineProperty(hookedConstructor, 'name', { 
-                value: original.name, 
+            HookedTextDecoder.prototype = original.prototype;
+            Object.defineProperty(HookedTextDecoder, 'name', { 
+                value: 'TextDecoder', 
                 configurable: true 
             });
-            Object.defineProperty(hookedConstructor, 'length', { 
-                value: original.length, 
-                configurable: true 
-            });
-
-            // Copy static methods
-            for (const prop in original) {
-                if (original.hasOwnProperty(prop) && typeof original[prop] === 'function') {
-                    hookedConstructor[prop] = original[prop];
+            
+            // Copy any static methods or properties
+            Object.getOwnPropertyNames(original).forEach(prop => {
+                if (prop !== 'length' && prop !== 'name' && prop !== 'prototype') {
+                    try {
+                        HookedTextDecoder[prop] = original[prop];
+                    } catch (e) {
+                        // Ignore errors for non-copyable properties
+                    }
                 }
-            }
+            });
 
             // Apply the hooked constructor
             if (this.config.stealthMode) {
-                this.stealthApplyHook(current, methodName, hookedConstructor, original);
+                this.stealthApplyHook(current, methodName, HookedTextDecoder, original);
             } else {
-                current[methodName] = hookedConstructor;
+                current[methodName] = HookedTextDecoder;
             }
 
-            hookConfig.hooked = hookedConstructor;
+            hookConfig.hooked = HookedTextDecoder;
             hookConfig.appliedAt = Date.now();
-            this.log(`Constructor hook applied to ${target}`);
+            this.log('TextDecoder hook applied successfully');
             return true;
-        },
-
-        // Apply multiple method hooks to an instance
-        applyInstanceHooks(instance, methodHooks) {
-            for (const methodName in methodHooks) {
-                const originalMethod = instance[methodName];
-                if (typeof originalMethod === 'function') {
-                    const hook = methodHooks[methodName];
-                    instance[methodName] = function(...args) {
-                        let processedArgs = args;
-                        
-                        // Before call
-                        if (hook.beforeCall) {
-                            processedArgs = hook.beforeCall.call(this, args, originalMethod) || args;
-                        }
-                        
-                        // Call original
-                        let result = originalMethod.apply(this, processedArgs);
-                        
-                        // Handle promises
-                        if (result instanceof Promise && hook.afterCall) {
-                            return result.then(async (resolved) => {
-                                const processed = await hook.afterCall.call(this, resolved, processedArgs, originalMethod);
-                                return processed !== undefined ? processed : resolved;
-                            });
-                        }
-                        
-                        // After call (sync)
-                        if (hook.afterCall) {
-                            const processed = hook.afterCall.call(this, result, processedArgs, originalMethod);
-                            return processed !== undefined ? processed : result;
-                        }
-                        
-                        return result;
-                    };
-                }
-            }
         },
 
         // Create the hooked function for regular functions
@@ -528,60 +479,6 @@
         setAutoApply(autoApply) {
             this.config.autoApply = autoApply;
             return this;
-        },
-
-        // Preset configurations
-        presets: {
-            // Text manipulation preset - FIXED for TextDecoder
-            textManipulation: function(config = {}) {
-                const hooks = [
-                    {
-                        target: 'TextDecoder',
-                        options: {
-                            method: 'decode', // This tells the system which method to hook on instances
-                            afterCall: config.textProcessor || function(result, args, original) {
-                                // Default text processing - override with config.textProcessor
-                                if (typeof result === 'string') {
-                                    console.log('TextDecoder intercepted text length:', result.length);
-                                    // Example modification
-                                    // return result.replace(/target/gi, 'replacement');
-                                }
-                                return result;
-                            }
-                        }
-                    }
-                ];
-                return hooks;
-            },
-
-            // Network monitoring preset
-            networkMonitor: function() {
-                return [
-                    {
-                        target: 'fetch',
-                        options: {
-                            method: 'fetch',
-                            beforeCall: function(args, original) {
-                                console.log('Fetch request:', {
-                                    url: args[0],
-                                    method: args[1]?.method || 'GET'
-                                });
-                                return args;
-                            }
-                        }
-                    },
-                    {
-                        target: 'XMLHttpRequest.prototype',
-                        options: {
-                            method: 'open',
-                            beforeCall: function(args, original) {
-                                console.log('XHR opened:', args[0], args[1]);
-                                return args;
-                            }
-                        }
-                    }
-                ];
-            }
         }
     };
 
