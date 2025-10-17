@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Universal Stealth Hooking Library
 // @namespace    http://tampermonkey.net/
-// @version      1.2
-// @description  Standalone universal hooking system
+// @version      2.0
+// @description  Complete universal hooking system with fixed TextDecoder
 // @author       L3Hong
 // @match        *://*/*
 // @run-at       document-start
@@ -131,11 +131,6 @@
                 const methodName = targetPath[targetPath.length - 1];
                 const original = current[methodName];
 
-                // Special handling for TextDecoder
-                if (target === 'TextDecoder') {
-                    return this.applyTextDecoderHook(current, methodName, original, hookConfig);
-                }
-
                 if (typeof original !== 'function') {
                     this.log(`Target is not a function: ${target}`);
                     return false;
@@ -144,8 +139,15 @@
                 // Store original
                 hookConfig.original = original;
 
-                // Create hooked version for regular functions
-                const hooked = this.createHookedFunction(target, hookConfig);
+                // Check if this is a constructor that needs special handling
+                const isConstructor = this.isConstructor(target, original);
+                
+                let hooked;
+                if (isConstructor) {
+                    hooked = this.createHookedConstructor(target, hookConfig);
+                } else {
+                    hooked = this.createHookedFunction(target, hookConfig);
+                }
                 
                 // Apply hook with stealth
                 if (this.config.stealthMode) {
@@ -156,7 +158,7 @@
 
                 hookConfig.hooked = hooked;
                 hookConfig.appliedAt = Date.now();
-                this.log(`Hook applied to ${target}`);
+                this.log(`Hook applied to ${target} (${isConstructor ? 'constructor' : 'function'})`);
                 return true;
 
             } catch (error) {
@@ -165,72 +167,116 @@
             }
         },
 
-        // Special hook for TextDecoder that properly handles constructor AND decode method
-        applyTextDecoderHook(current, methodName, original, hookConfig) {
+        // Check if target is a constructor that needs special handling
+        isConstructor(target, original) {
+            // List of known constructors that require 'new' operator
+            const constructors = [
+                'TextDecoder', 'TextEncoder', 'XMLHttpRequest', 'Blob', 
+                'File', 'FileReader', 'WebSocket', 'EventSource',
+                'AudioContext', 'OfflineAudioContext', 'RTCPeerConnection'
+            ];
+            
+            const targetName = target.split('.').pop();
+            return constructors.includes(targetName);
+        },
+
+        // Create hooked constructor using Proxy
+        createHookedConstructor(target, hookConfig) {
             const self = this;
-            
-            // Store original
-            hookConfig.original = original;
+            const original = hookConfig.original;
 
-            // Create a proper constructor wrapper
-            const HookedTextDecoder = function(...args) {
-                if (!new.target) {
-                    throw new TypeError("Failed to construct 'TextDecoder': Please use the 'new' operator");
-                }
-                
-                // Create instance with original constructor
-                const instance = new original(...args);
-                
-                // Hook the decode method on this specific instance
-                const originalDecode = instance.decode;
-                instance.decode = function(...decodeArgs) {
-                    const result = originalDecode.apply(this, decodeArgs);
+            return new Proxy(original, {
+                construct(target, args, newTarget) {
+                    // Create instance using original constructor
+                    const instance = Reflect.construct(target, args, newTarget);
                     
-                    // Apply the afterCall hook if provided
-                    if (hookConfig.afterCall) {
-                        try {
-                            return hookConfig.afterCall.call(this, result, decodeArgs, originalDecode);
-                        } catch (e) {
-                            self.log('Error in TextDecoder.afterCall:', e);
+                    // Hook the specified method on the instance
+                    const methodToHook = hookConfig.method;
+                    if (methodToHook && typeof instance[methodToHook] === 'function') {
+                        const originalMethod = instance[methodToHook];
+                        
+                        instance[methodToHook] = function(...methodArgs) {
+                            // Before call hook
+                            let processedArgs = methodArgs;
+                            if (hookConfig.beforeCall) {
+                                try {
+                                    processedArgs = hookConfig.beforeCall.call(this, methodArgs, originalMethod);
+                                    if (!Array.isArray(processedArgs)) {
+                                        processedArgs = methodArgs;
+                                    }
+                                } catch (e) {
+                                    self.log(`Error in beforeCall for ${target}.${methodToHook}:`, e);
+                                    processedArgs = methodArgs;
+                                }
+                            }
+
+                            // Call original method
+                            let result;
+                            try {
+                                result = originalMethod.apply(this, processedArgs);
+                            } catch (error) {
+                                if (hookConfig.onError) {
+                                    const errorResult = hookConfig.onError.call(this, error, processedArgs, originalMethod);
+                                    if (errorResult !== undefined) {
+                                        return errorResult;
+                                    }
+                                }
+                                throw error;
+                            }
+
+                            // Handle promises for async methods
+                            if (result instanceof Promise) {
+                                return result.then(async (resolvedResult) => {
+                                    if (hookConfig.afterCall) {
+                                        try {
+                                            const processedResult = await hookConfig.afterCall.call(this, resolvedResult, processedArgs, originalMethod);
+                                            return processedResult !== undefined ? processedResult : resolvedResult;
+                                        } catch (e) {
+                                            self.log(`Error in afterCall (async) for ${target}.${methodToHook}:`, e);
+                                            return resolvedResult;
+                                        }
+                                    }
+                                    return resolvedResult;
+                                }).catch(error => {
+                                    if (hookConfig.onError) {
+                                        const errorResult = hookConfig.onError.call(this, error, processedArgs, originalMethod);
+                                        if (errorResult !== undefined) {
+                                            return Promise.resolve(errorResult);
+                                        }
+                                    }
+                                    return Promise.reject(error);
+                                });
+                            }
+
+                            // After call hook for sync methods
+                            if (hookConfig.afterCall) {
+                                try {
+                                    const processedResult = hookConfig.afterCall.call(this, result, processedArgs, originalMethod);
+                                    return processedResult !== undefined ? processedResult : result;
+                                } catch (e) {
+                                    self.log(`Error in afterCall for ${target}.${methodToHook}:`, e);
+                                    return result;
+                                }
+                            }
+
                             return result;
-                        }
-                    }
-                    
-                    return result;
-                };
-                
-                return instance;
-            };
+                        };
 
-            // Copy prototype and static properties
-            HookedTextDecoder.prototype = original.prototype;
-            Object.defineProperty(HookedTextDecoder, 'name', { 
-                value: 'TextDecoder', 
-                configurable: true 
-            });
-            
-            // Copy any static methods or properties
-            Object.getOwnPropertyNames(original).forEach(prop => {
-                if (prop !== 'length' && prop !== 'name' && prop !== 'prototype') {
-                    try {
-                        HookedTextDecoder[prop] = original[prop];
-                    } catch (e) {
-                        // Ignore errors for non-copyable properties
+                        // Preserve method properties
+                        self.preserveFunctionProperties(instance[methodToHook], originalMethod);
                     }
+
+                    return instance;
+                },
+
+                // Handle regular function calls (without new) - throw error for constructors
+                apply(target, thisArg, args) {
+                    if (self.isConstructor(target, original)) {
+                        throw new TypeError(`Failed to construct '${target.name}': Please use the 'new' operator`);
+                    }
+                    return Reflect.apply(target, thisArg, args);
                 }
             });
-
-            // Apply the hooked constructor
-            if (this.config.stealthMode) {
-                this.stealthApplyHook(current, methodName, HookedTextDecoder, original);
-            } else {
-                current[methodName] = HookedTextDecoder;
-            }
-
-            hookConfig.hooked = HookedTextDecoder;
-            hookConfig.appliedAt = Date.now();
-            this.log('TextDecoder hook applied successfully');
-            return true;
         },
 
         // Create the hooked function for regular functions
@@ -456,7 +502,8 @@
                 status.hooks[target] = {
                     active: this.config.hooks[target].active,
                     applied: !!this.config.hooks[target].appliedAt,
-                    method: this.config.hooks[target].method
+                    method: this.config.hooks[target].method,
+                    type: this.isConstructor(target, this.config.hooks[target].original) ? 'constructor' : 'function'
                 };
             }
 
@@ -479,6 +526,103 @@
         setAutoApply(autoApply) {
             this.config.autoApply = autoApply;
             return this;
+        },
+
+        // Preset configurations
+        presets: {
+            // Text manipulation preset - FIXED for TextDecoder
+            textManipulation: function(config = {}) {
+                return [
+                    {
+                        target: 'TextDecoder',
+                        options: {
+                            method: 'decode',
+                            afterCall: config.textProcessor || function(result, args, original) {
+                                if (typeof result === 'string') {
+                                    console.log('[TextDecoder] Decoded text length:', result.length);
+                                    // Add your text processing here
+                                    // return result.replace(/pattern/gi, 'replacement');
+                                }
+                                return result;
+                            }
+                        }
+                    }
+                ];
+            },
+
+            // Network monitoring preset
+            networkMonitor: function() {
+                return [
+                    {
+                        target: 'fetch',
+                        options: {
+                            method: 'fetch',
+                            beforeCall: function(args, original) {
+                                console.log('[Fetch] Request:', {
+                                    url: args[0],
+                                    method: args[1]?.method || 'GET'
+                                });
+                                return args;
+                            },
+                            afterCall: async function(result, args, original) {
+                                const response = result;
+                                try {
+                                    const clone = response.clone();
+                                    const text = await clone.text();
+                                    console.log('[Fetch] Response length:', text.length);
+                                } catch (e) {
+                                    // Ignore non-text responses
+                                }
+                                return response;
+                            }
+                        }
+                    },
+                    {
+                        target: 'XMLHttpRequest.prototype',
+                        options: {
+                            method: 'open',
+                            beforeCall: function(args, original) {
+                                console.log('[XHR] Open:', args[0], args[1]);
+                                return args;
+                            }
+                        }
+                    }
+                ];
+            },
+
+            // Game data interception preset
+            gameDataInterceptor: function() {
+                return [
+                    {
+                        target: 'WebSocket',
+                        options: {
+                            method: 'send',
+                            beforeCall: function(args, original) {
+                                if (args[0] && typeof args[0] === 'string') {
+                                    console.log('[WebSocket] Send:', args[0].substring(0, 200));
+                                }
+                                return args;
+                            }
+                        }
+                    },
+                    {
+                        target: 'TextDecoder',
+                        options: {
+                            method: 'decode',
+                            afterCall: function(result, args, original) {
+                                if (typeof result === 'string') {
+                                    // Look for game-related data
+                                    if (result.includes('"game"') || result.includes('"player"') || 
+                                        result.includes('"score"') || result.includes('"health"')) {
+                                        console.log('[Game Data] Intercepted:', result.substring(0, 300));
+                                    }
+                                }
+                                return result;
+                            }
+                        }
+                    }
+                ];
+            }
         }
     };
 
