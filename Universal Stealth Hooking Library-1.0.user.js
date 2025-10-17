@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Universal Stealth Hooking Library
 // @namespace    http://tampermonkey.net/
-// @version      1.0
-// @description  Standalone universal hooking system for Tampermonkey scripts
+// @version      1.1
+// @description  Standalone universal hooking system for Tampermonkey scripts - Fixed TextDecoder
 // @author       L3Hong
 // @match        *://*/*
 // @run-at       document-start
@@ -51,12 +51,12 @@
             };
 
             this.log(`Hook added for ${target}.${options.method}`);
-
+            
             // Auto-apply if system is already running
             if (this.config.autoApply) {
                 setTimeout(() => this.applyHook(target), 0);
             }
-
+            
             return true;
         },
 
@@ -108,7 +108,6 @@
                 }
             }
             this.setupRedefinitionProtection();
-            this.setupEarlyInstanceHooking();
         },
 
         // Apply a specific hook
@@ -119,7 +118,7 @@
             try {
                 const targetPath = target.split('.');
                 let current = window;
-
+                
                 // Navigate to the target object
                 for (let i = 0; i < targetPath.length - 1; i++) {
                     if (!current[targetPath[i]]) {
@@ -132,6 +131,11 @@
                 const methodName = targetPath[targetPath.length - 1];
                 const original = current[methodName];
 
+                // Handle constructor hooks differently
+                if (this.isConstructor(target, original)) {
+                    return this.applyConstructorHook(target, current, methodName, original, hookConfig);
+                }
+
                 if (typeof original !== 'function') {
                     this.log(`Target is not a function: ${target}`);
                     return false;
@@ -140,9 +144,9 @@
                 // Store original
                 hookConfig.original = original;
 
-                // Create hooked version
+                // Create hooked version for regular functions
                 const hooked = this.createHookedFunction(target, hookConfig);
-
+                
                 // Apply hook with stealth
                 if (this.config.stealthMode) {
                     this.stealthApplyHook(current, methodName, hooked, original);
@@ -161,10 +165,127 @@
             }
         },
 
-        // Create the hooked function
+        // Check if target is a constructor
+        isConstructor(target, original) {
+            if (typeof original !== 'function') return false;
+            
+            // Common constructors that need special handling
+            const constructors = ['TextDecoder', 'TextEncoder', 'XMLHttpRequest', 'Blob', 'File', 'FileReader'];
+            const targetName = target.split('.').pop();
+            
+            return constructors.includes(targetName) || 
+                   original.prototype && 
+                   original.prototype.constructor === original;
+        },
+
+        // Apply hook to constructor functions
+        applyConstructorHook(target, current, methodName, original, hookConfig) {
+            const self = this;
+            
+            // Store original constructor
+            hookConfig.original = original;
+
+            // Create hooked constructor
+            const hookedConstructor = function(...args) {
+                // Ensure called with new
+                if (!new.target) {
+                    throw new TypeError(`Failed to construct '${methodName}': Please use the 'new' operator`);
+                }
+
+                // Create instance with original constructor
+                const instance = new original(...args);
+
+                // Apply method hooks to the instance
+                if (hookConfig.methodHooks) {
+                    self.applyInstanceHooks(instance, hookConfig.methodHooks);
+                }
+
+                // Apply specific method hook if provided
+                if (hookConfig.method && hookConfig.afterCall) {
+                    const originalMethod = instance[hookConfig.method];
+                    if (typeof originalMethod === 'function') {
+                        instance[hookConfig.method] = function(...methodArgs) {
+                            const result = originalMethod.apply(this, methodArgs);
+                            return hookConfig.afterCall.call(this, result, methodArgs, originalMethod);
+                        };
+                    }
+                }
+
+                return instance;
+            };
+
+            // Copy prototype and static properties
+            hookedConstructor.prototype = original.prototype;
+            Object.defineProperty(hookedConstructor, 'name', { 
+                value: original.name, 
+                configurable: true 
+            });
+            Object.defineProperty(hookedConstructor, 'length', { 
+                value: original.length, 
+                configurable: true 
+            });
+
+            // Copy static methods
+            for (const prop in original) {
+                if (original.hasOwnProperty(prop) && typeof original[prop] === 'function') {
+                    hookedConstructor[prop] = original[prop];
+                }
+            }
+
+            // Apply the hooked constructor
+            if (this.config.stealthMode) {
+                this.stealthApplyHook(current, methodName, hookedConstructor, original);
+            } else {
+                current[methodName] = hookedConstructor;
+            }
+
+            hookConfig.hooked = hookedConstructor;
+            hookConfig.appliedAt = Date.now();
+            this.log(`Constructor hook applied to ${target}`);
+            return true;
+        },
+
+        // Apply multiple method hooks to an instance
+        applyInstanceHooks(instance, methodHooks) {
+            for (const methodName in methodHooks) {
+                const originalMethod = instance[methodName];
+                if (typeof originalMethod === 'function') {
+                    const hook = methodHooks[methodName];
+                    instance[methodName] = function(...args) {
+                        let processedArgs = args;
+                        
+                        // Before call
+                        if (hook.beforeCall) {
+                            processedArgs = hook.beforeCall.call(this, args, originalMethod) || args;
+                        }
+                        
+                        // Call original
+                        let result = originalMethod.apply(this, processedArgs);
+                        
+                        // Handle promises
+                        if (result instanceof Promise && hook.afterCall) {
+                            return result.then(async (resolved) => {
+                                const processed = await hook.afterCall.call(this, resolved, processedArgs, originalMethod);
+                                return processed !== undefined ? processed : resolved;
+                            });
+                        }
+                        
+                        // After call (sync)
+                        if (hook.afterCall) {
+                            const processed = hook.afterCall.call(this, result, processedArgs, originalMethod);
+                            return processed !== undefined ? processed : result;
+                        }
+                        
+                        return result;
+                    };
+                }
+            }
+        },
+
+        // Create the hooked function for regular functions
         createHookedFunction(target, hookConfig) {
             const self = this;
-
+            
             const hookedFunction = function(...args) {
                 const hook = self.config.hooks[target];
                 if (!hook || !hook.active) {
@@ -246,17 +367,17 @@
         preserveFunctionProperties(hooked, original) {
             try {
                 Object.defineProperties(hooked, {
-                    name: {
-                        value: original.name || 'hooked',
-                        configurable: true
+                    name: { 
+                        value: original.name || 'hooked', 
+                        configurable: true 
                     },
-                    length: {
-                        value: original.length,
-                        configurable: true
+                    length: { 
+                        value: original.length, 
+                        configurable: true 
                     },
-                    toString: {
-                        value: function() {
-                            return `function ${original.name}() { [native code] }`;
+                    toString: { 
+                        value: function() { 
+                            return `function ${original.name}() { [native code] }`; 
                         },
                         configurable: true
                     }
@@ -284,40 +405,6 @@
             }
         },
 
-        // Hook early instances created before our hook was applied
-        setupEarlyInstanceHooking() {
-            if (!this.config.stealthMode) return;
-
-            // Hook Function constructor to catch dynamic code generation
-            const originalFunction = Function.prototype.constructor;
-            const self = this;
-
-            Function.prototype.constructor = function(...args) {
-                if (args.length > 0 && typeof args[0] === 'string') {
-                    let code = args[0];
-
-                    // Check if any of our hooks might be affected
-                    for (const target in self.config.hooks) {
-                        const targetPath = target.split('.');
-                        const methodName = targetPath[targetPath.length - 1];
-
-                        if (code.includes(methodName) && self.config.hooks[target].active) {
-                            self.log(`Intercepted dynamic code containing ${methodName}`);
-                            // You could modify the code here if needed
-                        }
-                    }
-
-                    return originalFunction.apply(this, args);
-                }
-                return originalFunction.apply(this, args);
-            };
-
-            // Restore original after a while to avoid detection
-            setTimeout(() => {
-                Function.prototype.constructor = originalFunction;
-            }, 5000);
-        },
-
         // Setup redefinition protection
         setupRedefinitionProtection() {
             if (!this.config.stealthMode) return;
@@ -325,7 +412,7 @@
             const redefinitionCount = {};
             const originalDefine = Object.defineProperty;
             const self = this;
-
+            
             Object.defineProperty = function(obj, prop, descriptor) {
                 if (obj === window || obj === self.getGlobalObject()) {
                     for (const target in self.config.hooks) {
@@ -368,7 +455,7 @@
             try {
                 const targetPath = target.split('.');
                 let current = window;
-
+                
                 for (let i = 0; i < targetPath.length - 1; i++) {
                     current = current[targetPath[i]];
                     if (!current) return false;
@@ -376,7 +463,7 @@
 
                 const methodName = targetPath[targetPath.length - 1];
                 current[methodName] = hookConfig.original;
-
+                
                 this.log(`Original restored for ${target}`);
                 return true;
             } catch (error) {
@@ -445,32 +532,21 @@
 
         // Preset configurations
         presets: {
-            // Text manipulation preset
+            // Text manipulation preset - FIXED for TextDecoder
             textManipulation: function(config = {}) {
                 const hooks = [
                     {
                         target: 'TextDecoder',
                         options: {
-                            method: 'decode',
+                            method: 'decode', // This tells the system which method to hook on instances
                             afterCall: config.textProcessor || function(result, args, original) {
                                 // Default text processing - override with config.textProcessor
                                 if (typeof result === 'string') {
                                     console.log('TextDecoder intercepted text length:', result.length);
+                                    // Example modification
+                                    // return result.replace(/target/gi, 'replacement');
                                 }
                                 return result;
-                            }
-                        }
-                    },
-                    {
-                        target: 'XMLHttpRequest.prototype',
-                        options: {
-                            method: 'responseText',
-                            get: function() {
-                                const originalValue = this._responseText;
-                                if (config.textProcessor && typeof originalValue === 'string') {
-                                    return config.textProcessor(originalValue);
-                                }
-                                return originalValue;
                             }
                         }
                     }
@@ -488,8 +564,7 @@
                             beforeCall: function(args, original) {
                                 console.log('Fetch request:', {
                                     url: args[0],
-                                    method: args[1]?.method || 'GET',
-                                    headers: args[1]?.headers
+                                    method: args[1]?.method || 'GET'
                                 });
                                 return args;
                             }
@@ -502,30 +577,6 @@
                             beforeCall: function(args, original) {
                                 console.log('XHR opened:', args[0], args[1]);
                                 return args;
-                            }
-                        }
-                    }
-                ];
-            },
-
-            // Anti-detection preset
-            antiDetection: function() {
-                return [
-                    {
-                        target: 'Navigator.prototype',
-                        options: {
-                            method: 'webdriver',
-                            get: function() {
-                                return false;
-                            }
-                        }
-                    },
-                    {
-                        target: 'window',
-                        options: {
-                            method: 'chrome',
-                            get: function() {
-                                return undefined;
                             }
                         }
                     }
